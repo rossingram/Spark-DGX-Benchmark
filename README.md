@@ -1,6 +1,6 @@
 # Spark-DGX-Benchmark
 
-A practical benchmark suite for the NVIDIA DGX Spark
+A practical benchmark suite for the [NVIDIA DGX Spark](https://docs.nvidia.com/dgx/dgx-spark/index.html)
 
 ---
 
