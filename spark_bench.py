@@ -511,15 +511,6 @@ def print_final_summary():
     Max safe VRAM         {fmt(results['vram_max_safe_gb']).rjust(8)}        18–20         70–80
     """)
 
-    print("\nINTERPRETATION:")
-    print("""
-    • Spark outperforms every consumer GPU (4090/5090-class)
-    • Sits below full GB200/H100/H200 servers — as expected
-    • Ideal system for home LLMs (7B–30B), SDXL, Flux, embeddings,
-      large context windows, fine-tuned research workloads
-    • Unified memory expands usable model sizes beyond VRAM class
-    """)
-
     print("\nCLASSIFICATION:")
     if results["gemm_4096_tflops"] and results["gemm_4096_tflops"] > 500:
         tier = "✔ DATACENTER-LITE TIER — almost H100-class compute"
