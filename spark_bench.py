@@ -482,7 +482,7 @@ def run_vram_bench():
 # ------------------------------------------------------------------------
 
 def print_final_summary():
-    log_section("FINAL SUMMARY — SPARK vs 4090 vs H100")
+    log_section("FINAL SUMMARY — SPARK vs OTHER GPUS")
 
     # Pull values with defaults
     gemm_4096 = results.get("gemm_4096_tflops")
@@ -497,8 +497,11 @@ def print_final_summary():
     llm_tps = results.get("llm_tokens_sec")
     vram_max = results.get("vram_max_gb")
 
+    # ---------------------------------------------------------------------
+    # 1) Microbenchmarks vs 4090 / H100 (same style as before)
+    # ---------------------------------------------------------------------
     print("""
-RAW COMPUTE (TFLOPs, FP16/BF16)
+RAW COMPUTE (TFLOPs, FP16/BF16 — Measured vs Rough 4090/H100 Targets)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
     ------------------------------------------------------------------------""")
@@ -507,19 +510,19 @@ RAW COMPUTE (TFLOPs, FP16/BF16)
     print(f"    GEMM 8192 size       {fmt(gemm_8192).rjust(8)}     330.00        1000.00")
 
     print("""
-MEMORY BANDWIDTH (GB/s)
+MEMORY BANDWIDTH (GB/s — Measured vs Approx)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
     ------------------------------------------------------------------------""")
-    print(f"    2GB clone             {fmt(bw_2g).rjust(8)}     700.00       2000.00")
-    print(f"    4GB clone             {fmt(bw_4g).rjust(8)}     700.00       2000.00")
+    print(f"    2GB copy              {fmt(bw_2g).rjust(8)}     ~700          ~2000")
+    print(f"    4GB copy              {fmt(bw_4g).rjust(8)}     ~700          ~2000")
 
     print("""
-KERNEL LATENCY (Microseconds)
+KERNEL LAUNCH LATENCY (Microseconds)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
     ------------------------------------------------------------------------""")
-    print(f"    Tiny kernel           {fmt(lat_us).rjust(8)}       15.00          5.00")
+    print(f"    Tiny kernel           {fmt(lat_us).rjust(8)}       ~15            ~5")
 
     print("""
 IMAGE MODELS
@@ -531,19 +534,46 @@ IMAGE MODELS
     print(f"    SDXL Turbo seconds    {fmt(sdxl_turbo).rjust(8)}     ~0.3s         ~0.15s")
 
     print("""
-LLM THROUGHPUT (tokens/sec)
+LLM THROUGHPUT (tokens/sec — Small Open Model)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
     ------------------------------------------------------------------------""")
     print(f"    SmolLM2 1.7B          {fmt(llm_tps).rjust(8)}     150–300       800–1200")
 
     print("""
-VRAM USABLE RANGE (GB)
+VRAM USABLE RANGE (GB — Single Allocation Probe)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
     ------------------------------------------------------------------------""")
     print(f"    Max safe VRAM         {fmt(vram_max).rjust(8)}        18–20         70–80")
 
+    # ---------------------------------------------------------------------
+    # 2) Reference GPU Landscape — spec-level, approximate
+    # ---------------------------------------------------------------------
+    print("""
+REFERENCE GPU LANDSCAPE (Approx FP16 Tensor TFLOPs / Memory BW / VRAM)
+    ------------------------------------------------------------------------
+    GPU               FP16 Tensor TFLOPs    Mem BW (GB/s)      VRAM / Memory
+    ------------------------------------------------------------------------
+    Spark GB10        ~   12                ~    30            128 GB unified
+    L40S              ~  730                ~   864             48 GB GDDR6
+    H200              ~ 1980                ~  4800            141 GB HBM3e
+    GH200 (NVL2)      ~ 2000+               up to 10000      up to 288 GB HBM
+    RTX 4090          ~  330                ~  1000             24 GB GDDR6X
+    H100              ~ 1000                ~  3300              80 GB HBM3
+    ------------------------------------------------------------------------
+
+Notes:
+- Spark GB10 is a **memory-centric**, low-power Blackwell GPU designed for large
+  models and unified memory, not raw training throughput.
+- L40S is an inference-optimized Ada Lovelace data center GPU (~733 FP16 TFLOPs,
+  ~864 GB/s bandwidth, 48 GB GDDR6).
+- H200 is Hopper with 141 GB HBM3e at ~4.8 TB/s, tuned for huge LLMs.
+- GH200 NVL2 pairs Grace + Hopper with up to 288 GB HBM and ~10 TB/s memory
+  bandwidth between GPUs.
+- 4090 / H100 are kept here as consumer / training upper bounds, but they live
+  in a different design space than Spark DGX.
+""")
 
 # ------------------------------------------------------------------------
 # MAIN
