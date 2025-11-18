@@ -6,7 +6,7 @@ nvfp4_gemm_bench.py
 Experimental "NVFP4-style" GEMM benchmark for NVIDIA DGX Spark (GB10).
 
 IMPORTANT:
-    - This script does NOT use real NVFP4 Tensor Core kernels yet.
+    - This script does NOT use real NVFP4 Tensor Core kernels yet (11/18/2025).
     - Today, PyTorch does not expose native FP4 (NVFP4) GEMM for Blackwell.
     - Instead, this benchmark:
         * Quantizes matrices to a symmetric 4-bit representation
