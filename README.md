@@ -10,7 +10,7 @@ The Spark DGX is a strange and fascinating machine — **128 GB of unified Black
 
 So ChatGPT and I created this benchmark.
 
-The goal is to provide a **practical, real-world performance snapshot** across the kinds of workloads people actually run today: GEMM throughput, memory bandwidth, kernel latency, SD1.5, SDXL, SDXL Turbo, LLM tokens/sec, and usable unified memory. The script also includes a reference comparison across **Spark, L40S, H200, GH200, 4090, and H100** so you can see where Spark fits in the broader GPU landscape.
+The goal is to provide a **practical, real-world performance snapshot** across the kinds of workloads people actually run today: [GEMM throughput](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html), memory bandwidth, kernel latency, SD1.5, SDXL, SDXL Turbo, LLM tokens/sec, and usable unified memory. The script also includes a reference comparison across **Spark, L40S, H200, GH200, 4090, and H100** so you can see where Spark fits in the broader GPU landscape.
 
 This isn’t meant to replicate NVIDIA’s theoretical peak numbers.
 It’s meant to show **what the Spark DGX actually delivers in user-space**, using standard PyTorch and diffusers pipelines. It gives owners a consistent baseline, helps set proper expectations, and highlights Spark’s real advantage:
