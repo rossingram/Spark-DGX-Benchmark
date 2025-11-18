@@ -316,6 +316,7 @@ def run_llm_bench():
 
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
     if not torch.cuda.is_available():
         log_section("7. LLM THROUGHPUT (PyTorch)")
@@ -323,16 +324,40 @@ def run_llm_bench():
         return
 
     log_section("7. LLM THROUGHPUT (PyTorch)")
-    model_id = "meta-llama/Llama-3-8b-instruct"
+
+    # Default: Llama 3 8B Instruct (gated, requires HF token + access)
+    # You can change this to an open model if you want (see below).
+    model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
     prompt = "Hello, this is a speed benchmark on the NVIDIA DGX Spark."
 
     print(f"Loading model: {model_id}")
-    tok = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        device_map="cuda"
-    )
+    try:
+        tok = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            device_map="cuda"
+        )
+    except GatedRepoError as e:
+        print("LLM model is gated on Hugging Face and requires authentication.")
+        print("Skipping LLM benchmark. Details:")
+        print(e)
+        return
+    except RepositoryNotFoundError as e:
+        print("LLM repo not found on Hugging Face. Check the model_id or your access.")
+        print("Skipping LLM benchmark. Details:")
+        print(e)
+        return
+    except OSError as e:
+        print("OS / HuggingFace Hub error while loading LLM model.")
+        print("This usually means missing access or a bad model_id.")
+        print("Skipping LLM benchmark. Details:")
+        print(e)
+        return
+    except Exception as e:
+        print("Unexpected error loading LLM model. Skipping LLM benchmark.")
+        print(e)
+        return
 
     inputs = tok(prompt, return_tensors="pt").to("cuda")
 
@@ -350,7 +375,6 @@ def run_llm_bench():
     tps = new_tokens / dt
     print(f"Generated {new_tokens} tokens in {dt:.2f} s  |  {tps:.1f} tokens/sec")
     record("llm_tokens_sec", tps)
-
 
 # -------- 8. TensorRT-LLM (if installed) -------- #
 
