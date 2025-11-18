@@ -269,6 +269,7 @@ def run_flux_bench():
 
     import torch
     from diffusers import DiffusionPipeline
+    from huggingface_hub.errors import GatedRepoError
 
     if not torch.cuda.is_available():
         log_section("6. FLUX (MMDiT)")
@@ -280,17 +281,27 @@ def run_flux_bench():
     prompt = "hello world on the NVIDIA DGX Spark"
 
     print(f"Loading pipeline: {model_id}")
-    pipe = DiffusionPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16
-    ).to("cuda")
+    try:
+        pipe = DiffusionPipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16
+        ).to("cuda")
+    except GatedRepoError as e:
+        print("Flux model is gated on Hugging Face and requires authentication.")
+        print("Skipping Flux benchmark. Details:")
+        print(e)
+        return
+    except Exception as e:
+        print("Unexpected error loading Flux model; skipping Flux benchmark.")
+        print(e)
+        return
 
     print("Running Flux benchmark...")
     torch.cuda.synchronize()
     t0 = time.time()
     _ = pipe(prompt).images[0]
     torch.cuda.synchronize()
-    dt = time.time()
+    dt = time.time() - t0
     print(f"Flux inference time: {dt:.2f} s")
     record("flux_seconds", dt)
 
