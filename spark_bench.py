@@ -131,15 +131,27 @@ def memory_bw(size_gb=2, key=None):
         print("CUDA not available; skipping memory bandwidth test.")
         return
 
-    log_sub(f"Memory bandwidth with ~{size_gb} GB tensor clone")
+    log_sub(f"Memory bandwidth with ~{size_gb} GB tensor copy")
     num_elems = int(size_gb * 1e9 / 2)  # FP16 = 2 bytes
-    x = torch.randn(num_elems, device="cuda", dtype=torch.float16)
+
+    a = torch.empty(num_elems, device="cuda", dtype=torch.float16)
+    b = torch.empty_like(a)
     torch.cuda.synchronize()
+
+    # Warmup
+    for _ in range(5):
+        b.copy_(a, non_blocking=True)
+    torch.cuda.synchronize()
+
     t0 = time.time()
-    y = x.clone()
+    for _ in range(10):
+        b.copy_(a, non_blocking=True)
     torch.cuda.synchronize()
     dt = time.time() - t0
-    bw = size_gb / dt
+
+    # 10 copies of size_gb each
+    total_gb = size_gb * 10
+    bw = total_gb / dt
     print(f"Time: {human_time(dt)}  |  Approx BW: {bw:.1f} GB/s")
     if key:
         record(key, bw)
