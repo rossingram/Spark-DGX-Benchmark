@@ -24,7 +24,7 @@ It’s meant to show **what the Spark DGX actually delivers in user-space**, usi
 This assumes:
 
 * Your DGX Spark is already set up and updated
-* You can SSH into the machine or access it through NVIDIA System UI / LaunchPad
+* You can SSH into the machine or access it through NVIDIA Sync
 * Docker is already working (it is by default on Spark)
 
 ---
