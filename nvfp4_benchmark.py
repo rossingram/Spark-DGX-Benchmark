@@ -242,4 +242,65 @@ def main():
         default="Explain why Paris is great in 2–3 sentences.",
         help="Prompt to use for all benchmark requests",
     )
-    parser.add
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=128,
+        help="Max tokens to request for each completion",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature",
+    )
+    parser.add_argument(
+        "--requests",
+        type=int,
+        default=16,
+        help="Number of measured requests per server (excluding warmup)",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=4,
+        help="Number of warmup requests per server",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Per-request timeout in seconds",
+    )
+
+    args = parser.parse_args()
+
+    baseline_summary = run_benchmark(
+        name="baseline",
+        url=args.baseline_url,
+        model=args.model,
+        prompt=args.prompt,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        requests_n=args.requests,
+        warmup=args.warmup,
+        timeout=args.timeout,
+    )
+
+    nvfp4_summary = run_benchmark(
+        name="nvfp4",
+        url=args.nvfp4_url,
+        model=args.model,
+        prompt=args.prompt,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        requests_n=args.requests,
+        warmup=args.warmup,
+        timeout=args.timeout,
+    )
+
+    print_compare_table(baseline_summary, nvfp4_summary)
+
+
+if __name__ == "__main__":
+    main()
