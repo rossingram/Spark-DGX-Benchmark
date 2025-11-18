@@ -33,13 +33,13 @@ This assumes:
 
 This container contains:
 
-* PyTorch **2.6+ with official Blackwell (sm_121) support**
-* CUDA **13.0**
+* PyTorch **2.9.0a0+50eac811a6 with official Blackwell (sm_121) support**
+* CUDA **13.0.1**
 * cuDNN, NCCL, Apex, and NVIDIA optimizations
 * A clean, known-good environment for reproducible benchmarks
 
 ```bash
-docker run --gpus all -it nvcr.io/nvidia/pytorch:25.01-py3
+docker run --gpus all -it nvcr.io/nvidia/pytorch:25.09-py3
 ```
 
 You should now be inside:
