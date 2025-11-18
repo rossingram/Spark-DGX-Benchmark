@@ -1,457 +1,274 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+
 """
-nvfp4_benchmark.py
+nvfp4_gemm_bench.py
 
-Simple "before vs after" benchmark for NVFP4-quantized models on DGX Spark.
+Experimental "NVFP4-style" GEMM benchmark for NVIDIA DGX Spark (GB10).
 
-This script assumes:
-  * You have a baseline model served behind an OpenAI-compatible API.
-  * You have an NVFP4-quantized model served behind an OpenAI-compatible API.
-  * Both servers implement POST /v1/chat/completions with payload:
-        {
-          "model": "<name>",
-          "prompt": "<prompt>",
-          "max_tokens": <int>,
-          "temperature": <float>,
-          "stream": false
-        }
+IMPORTANT:
+    - This script does NOT use real NVFP4 Tensor Core kernels yet.
+    - Today, PyTorch does not expose native FP4 (NVFP4) GEMM for Blackwell.
+    - Instead, this benchmark:
+        * Quantizes matrices to a symmetric 4-bit representation
+        * Dequantizes back to BF16
+        * Runs a BF16 GEMM via PyTorch
+    - The purpose is to:
+        * Provide a future-proof harness for FP4 benchmarking
+        * Let you compare "FP4-style" pipelines vs pure BF16
+        * Make it easy to plug in real FP4 kernels later (cuBLASLt / TensorRT-LLM / CUTLASS)
 
-Default ports:
-  * Baseline: http://localhost:8001/v1/chat/completions
-  * NVFP4:    http://localhost:8000/v1/chat/completions  (matches NVIDIA playbook)
+Usage (inside nvcr.io/nvidia/pytorch:25.09-py3):
 
-Example:
-
-  # Baseline container (unquantized model) on port 8001
-  # docker run ... trtllm-serve /workspace/model --backend pytorch --max_batch_size 4 --port 8001
-
-  # NVFP4 container (quantized model from nvFP4 playbook) on port 8000
-  # docker run ... trtllm-serve /workspace/model --backend pytorch --max_batch_size 4 --port 8000
-
-  python nvfp4_benchmark.py \
-    --baseline-url http://localhost:8001/v1/chat/completions \
-    --nvfp4-url    http://localhost:8000/v1/chat/completions \
-    --model deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
-    --prompt "Paris is great because" \
-    --requests 16 \
-    --warmup 4
+    python nvfp4_gemm_bench.py
+    python nvfp4_gemm_bench.py --size 8192 --iters 50
+    python nvfp4_gemm_bench.py --sizes 4096 8192 12288 --iters 30
 """
 
 import argparse
-import json
-import statistics
-import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
-from urllib import request as urllib_request
-from urllib.error import URLError, HTTPError
+
+import torch
 
 
-BANNER_WIDTH = 79
+def human_time(seconds: float) -> str:
+    if seconds < 1e-3:
+        return f"{seconds * 1e6:.1f} µs"
+    if seconds < 1:
+        return f"{seconds * 1e3:.1f} ms"
+    return f"{seconds:.2f} s"
 
 
-def banner(title: str) -> None:
-    print("=" * BANNER_WIDTH)
-    print(title)
-    print("=" * BANNER_WIDTH)
-
-
-def section(title: str) -> None:
-    print("\n" + title)
-    print("-" * len(title))
-
-
-def post_chat_completion(
-    url: str,
-    model: str,
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-    timeout: int,
-) -> Dict[str, Any]:
+def quantize_fp4_symmetric(x: torch.Tensor):
     """
-    Minimal HTTP client using stdlib only, to match the rest of this repo.
+    Simple symmetric 4-bit quantization:
+
+        - Target range: [-8, 7] (signed 4-bit)
+        - One global scale per tensor: scale = max(|x|) / 7
+        - Stored as int8 (we conceptually use only lower 4 bits)
+
+    This is NOT the exact NVFP4 hardware encoding, but it's good enough
+    for a "NVFP4-style" weight quantization pipeline benchmark.
     """
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": False,
-    }
+    if x.numel() == 0:
+        return torch.zeros_like(x, dtype=torch.int8), torch.tensor(1.0, device=x.device, dtype=torch.float32)
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib_request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    x_absmax = x.abs().max()
+    if x_absmax == 0:
+        scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)
+        q = torch.zeros_like(x, dtype=torch.int8)
+        return q, scale
 
-    try:
-        with urllib_request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                raise RuntimeError(f"Non-JSON response from {url}: {raw[:500]}")
-    except HTTPError as e:
-        raise RuntimeError(f"HTTP error from {url}: {e.code} {e.reason}") from e
-    except URLError as e:
-        raise RuntimeError(f"Connection error to {url}: {e.reason}") from e
+    scale = x_absmax / 7.0  # 4-bit signed: -8..7 -> 7 is max magnitude
+    x_scaled = x / scale
+    q = torch.round(x_scaled).clamp(-8, 7).to(torch.int8)
+    return q, scale
 
 
-def extract_completion_tokens(response: Dict[str, Any]) -> int:
+def dequantize_fp4_symmetric(q: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16):
     """
-    Try to get completion_tokens from OpenAI-style 'usage'.
-    Fallback: approximate via word count on first choice.
+    Dequantize int8 back to float using the symmetric scale.
     """
-    usage = response.get("usage") or {}
-    if "completion_tokens" in usage:
-        return int(usage["completion_tokens"])
-
-    choices = response.get("choices") or []
-    if not choices:
-        return 0
-
-    # Handle both chat-style and text-style responses.
-    first = choices[0]
-    content = ""
-
-    if "message" in first and isinstance(first["message"], dict):
-        content = first["message"].get("content") or ""
-    elif "text" in first:
-        content = first.get("text") or ""
-
-    if not isinstance(content, str):
-        return 0
-
-    # Very rough approximation if the server did not provide usage.
-    return max(1, len(content.split()))
+    x = q.to(torch.float32) * scale
+    return x.to(dtype)
 
 
-def run_benchmark_for_server(
-    name: str,
-    url: str,
-    model: str,
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-    requests_n: int,
-    warmup: int,
-    timeout: int,
-) -> Dict[str, Any]:
+def run_bf16_gemm(size: int, iters: int) -> float:
     """
-    Run warmup + measured requests for a single server and collect stats.
+    Baseline BF16 GEMM:
+
+        C = A @ B
+        A: [size, size], BF16
+        B: [size, size], BF16
+
+    Returns approximate TFLOPs.
     """
-    section(f"Benchmarking {name}")
-    print(f"  URL:   {url}")
-    print(f"  Model: {model}")
-    print(f"  Prompt: {prompt!r}")
-    print(f"  Requests: {requests_n} (warmup: {warmup})")
+    print(f"\n=== BASELINE BF16 GEMM: size={size} x {size}, iters={iters} ===")
 
-    latencies: List[float] = []
-    tokens_per_s: List[float] = []
-    total_tokens = 0
-
-    total_iters = warmup + requests_n
-
-    for i in range(total_iters):
-        is_warmup = i < warmup
-        label = "warmup" if is_warmup else "run"
-        idx = i + 1
-
-        t0 = time.time()
-        try:
-            resp = post_chat_completion(
-                url=url,
-                model=model,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout=timeout,
-            )
-        except Exception as e:
-            elapsed = time.time() - t0
-            print(
-                f"  [{name} {label} {idx}/{total_iters}] ERROR after {elapsed:.3f}s: {e}",
-                file=sys.stderr,
-            )
-            if not is_warmup:
-                # Count as failed; we just skip stats for this iteration.
-                continue
-            else:
-                continue
-
-        elapsed = time.time() - t0
-        completion_tokens = extract_completion_tokens(resp)
-
-        print(
-            f"  [{name} {label} {idx}/{total_iters}] "
-            f"latency={elapsed:.3f}s, completion_tokens={completion_tokens}"
-        )
-
-        if not is_warmup:
-            latencies.append(elapsed)
-            total_tokens += completion_tokens
-            if elapsed > 0 and completion_tokens > 0:
-                tokens_per_s.append(completion_tokens / elapsed)
-
-    if not latencies:
-        raise RuntimeError(f"No successful benchmark runs for {name}")
-
-    summary = {
-        "name": name,
-        "url": url,
-        "model": model,
-        "requests": len(latencies),
-        "total_tokens": total_tokens,
-        "latency_mean": statistics.fmean(latencies),
-        "latency_p50": statistics.median(latencies),
-        "latency_p90": percentile(latencies, 90),
-        "latency_p99": percentile(latencies, 99),
-        "throughput_tok_per_s_mean": statistics.fmean(tokens_per_s)
-        if tokens_per_s
-        else 0.0,
-        "throughput_tok_per_s_p50": statistics.median(tokens_per_s)
-        if tokens_per_s
-        else 0.0,
-        "throughput_tok_per_s_p90": percentile(tokens_per_s, 90)
-        if tokens_per_s
-        else 0.0,
-        "throughput_tok_per_s_p99": percentile(tokens_per_s, 99)
-        if tokens_per_s
-        else 0.0,
-    }
-
-    return summary
-
-
-def percentile(values: List[float], p: float) -> float:
-    if not values:
+    if not torch.cuda.is_available():
+        print("CUDA is not available; aborting baseline BF16 GEMM.")
         return 0.0
-    values = sorted(values)
-    k = (len(values) - 1) * (p / 100.0)
-    f = int(k)
-    c = min(f + 1, len(values) - 1)
-    if f == c:
-        return values[f]
-    d0 = values[f] * (c - k)
-    d1 = values[c] * (k - f)
-    return d0 + d1
+
+    device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
+    A = torch.randn(size, size, device=device, dtype=torch.bfloat16)
+    B = torch.randn(size, size, device=device, dtype=torch.bfloat16)
+    A = A.contiguous()
+    B = B.contiguous()
+
+    warmup_iters = min(20, max(5, iters // 5))
+    print(f"Warmup (BF16): {warmup_iters} iters...")
+    for _ in range(warmup_iters):
+        _ = A @ B
+    torch.cuda.synchronize()
+
+    print("Benchmarking BF16 GEMM...")
+    t0 = time.time()
+    for _ in range(iters):
+        _ = A @ B
+    torch.cuda.synchronize()
+    dt = time.time() - t0
+
+    flops = 2.0 * (size**3) * iters
+    tflops = flops / dt / 1e12
+
+    print(f"BF16 total time: {human_time(dt)} for {iters} iters")
+    print(f"BF16 approx TFLOPs: {tflops:.2f}")
+    return tflops
 
 
-def ratio(baseline: float, nvfp4: float) -> Optional[float]:
-    if baseline == 0:
-        return None
-    return nvfp4 / baseline
+def run_nvfp4_style_gemm(size: int, iters: int) -> float:
+    """
+    "NVFP4-style" GEMM:
+
+        - Start from FP32 weights
+        - Quantize both A and B to 4-bit (symmetric)
+        - Dequantize back to BF16 for GEMM
+        - Run GEMM in BF16 using PyTorch
+
+    This simulates a pipeline where weights are stored in FP4
+    but matmul is implemented using BF16 GEMM (until native FP4
+    kernels are available in user space).
+
+    Returns approximate "effective" TFLOPs (still measured as 2*N^3 / time).
+    """
+    print(f"\n=== NVFP4-STYLE GEMM (SIMULATED): size={size} x {size}, iters={iters} ===")
+
+    if not torch.cuda.is_available():
+        print("CUDA is not available; aborting NVFP4-style GEMM.")
+        return 0.0
+
+    device = torch.device("cuda")
+
+    # Start from higher-precision weights (FP32)
+    A_fp32 = torch.randn(size, size, device=device, dtype=torch.float32)
+    B_fp32 = torch.randn(size, size, device=device, dtype=torch.float32)
+
+    # Quantize once (as if we stored weights in FP4)
+    print("Quantizing A/B to 4-bit (symmetric)...")
+    A_q, A_scale = quantize_fp4_symmetric(A_fp32)
+    B_q, B_scale = quantize_fp4_symmetric(B_fp32)
+
+    # Dequantize to BF16 for matmul
+    A_bf16 = dequantize_fp4_symmetric(A_q, A_scale, dtype=torch.bfloat16).contiguous()
+    B_bf16 = dequantize_fp4_symmetric(B_q, B_scale, dtype=torch.bfloat16).contiguous()
+
+    # Warmup
+    warmup_iters = min(20, max(5, iters // 5))
+    print(f"Warmup (NVFP4-style BF16 GEMM): {warmup_iters} iters...")
+    for _ in range(warmup_iters):
+        _ = A_bf16 @ B_bf16
+    torch.cuda.synchronize()
+
+    print("Benchmarking NVFP4-style GEMM (BF16 matmul on dequantized FP4 weights)...")
+    t0 = time.time()
+    for _ in range(iters):
+        _ = A_bf16 @ B_bf16
+    torch.cuda.synchronize()
+    dt = time.time() - t0
+
+    flops = 2.0 * (size**3) * iters
+    tflops = flops / dt / 1e12
+
+    print(f"NVFP4-style total time: {human_time(dt)} for {iters} iters")
+    print(f"NVFP4-style approx TFLOPs (BF16 matmul): {tflops:.2f}")
+
+    return tflops
 
 
-def print_single_summary(summary: Dict[str, Any]) -> None:
-    name = summary["name"]
+def print_env_info():
+    print("=== ENVIRONMENT / GPU INFO (NVFP4-STYLE GEMM BENCH) ===")
 
-    section(f"{name.upper()} SUMMARY")
-    print(f"  URL:   {summary['url']}")
-    print(f"  Model: {summary['model']}")
-    print(f"  Requests: {summary['requests']}")
-    print(f"  Total tokens: {summary['total_tokens']}")
-    print()
-    print(f"  Latency mean (s):       {summary['latency_mean']:.3f}")
-    print(f"  Latency p50 (s):        {summary['latency_p50']:.3f}")
-    print(f"  Latency p90 (s):        {summary['latency_p90']:.3f}")
-    print(f"  Latency p99 (s):        {summary['latency_p99']:.3f}")
-    print()
-    print(
-        f"  Throughput mean (tok/s): {summary['throughput_tok_per_s_mean']:.3f}"
-    )
-    print(
-        f"  Throughput p50 (tok/s):  {summary['throughput_tok_per_s_p50']:.3f}"
-    )
-    print(
-        f"  Throughput p90 (tok/s):  {summary['throughput_tok_per_s_p90']:.3f}"
-    )
-    print(
-        f"  Throughput p99 (tok/s):  {summary['throughput_tok_per_s_p99']:.3f}"
-    )
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available : {torch.cuda.is_available()}")
 
-
-def print_compare_table(
-    baseline: Dict[str, Any], nvfp4: Dict[str, Any]
-) -> None:
-    banner("FINAL SUMMARY — NVFP4 vs BASELINE (LLM INFERENCE)")
-
-    print(f"Baseline: {baseline['name']}  ({baseline['url']})")
-    print(f"NVFP4:    {nvfp4['name']}  ({nvfp4['url']})")
-    print()
-    print(
-        "Note: Ratios are NVFP4/Baseline. "
-        "For latency, values < 1.0 = faster. For throughput, > 1.0 = better."
-    )
-    print()
-
-    rows = [
-        ("Requests", baseline["requests"], nvfp4["requests"], False),
-        ("Total tokens", baseline["total_tokens"], nvfp4["total_tokens"], False),
-        ("Latency mean (s)", baseline["latency_mean"], nvfp4["latency_mean"], True),
-        ("Latency p50 (s)", baseline["latency_p50"], nvfp4["latency_p50"], True),
-        ("Latency p90 (s)", baseline["latency_p90"], nvfp4["latency_p90"], True),
-        ("Latency p99 (s)", baseline["latency_p99"], nvfp4["latency_p99"], True),
-        (
-            "Throughput mean (tok/s)",
-            baseline["throughput_tok_per_s_mean"],
-            nvfp4["throughput_tok_per_s_mean"],
-            True,
-        ),
-        (
-            "Throughput p50 (tok/s)",
-            baseline["throughput_tok_per_s_p50"],
-            nvfp4["throughput_tok_per_s_p50"],
-            True,
-        ),
-        (
-            "Throughput p90 (tok/s)",
-            baseline["throughput_tok_per_s_p90"],
-            nvfp4["throughput_tok_per_s_p90"],
-            True,
-        ),
-        (
-            "Throughput p99 (tok/s)",
-            baseline["throughput_tok_per_s_p99"],
-            nvfp4["throughput_tok_per_s_p99"],
-            True,
-        ),
-    ]
-
-    col_name_w = max(len(r[0]) for r in rows) + 2
-    header = (
-        f"{'Metric'.ljust(col_name_w)} | "
-        f"{'Baseline'.rjust(12)} | "
-        f"{'NVFP4'.rjust(12)} | "
-        f"{'NVFP4/Baseline'.rjust(15)}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    for name, base_val, nv_val, show_ratio in rows:
-        if isinstance(base_val, int) and isinstance(nv_val, int):
-            base_str = f"{base_val:d}".rjust(12)
-            nv_str = f"{nv_val:d}".rjust(12)
-        else:
-            base_str = f"{base_val:12.3f}"
-            nv_str = f"{nv_val:12.3f}"
-
-        if show_ratio and isinstance(base_val, (int, float)):
-            r = ratio(float(base_val), float(nv_val))
-            ratio_str = f"{r:15.3f}" if r is not None else " " * 15
-        else:
-            ratio_str = " " * 15
-
-        print(
-            f"{name.ljust(col_name_w)} | {base_str} | {nv_str} | {ratio_str}"
-        )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark NVFP4-quantized model vs baseline over an "
-            "OpenAI-compatible TRT-LLM API."
-        )
-    )
-    parser.add_argument(
-        "--baseline-url",
-        default="http://localhost:8001/v1/chat/completions",
-        help="Baseline server URL (OpenAI-compatible /v1/chat/completions).",
-    )
-    parser.add_argument(
-        "--nvfp4-url",
-        default="http://localhost:8000/v1/chat/completions",
-        help="NVFP4 server URL (OpenAI-compatible /v1/chat/completions).",
-    )
-    parser.add_argument(
-        "--model",
-        default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
-        help="Model name to send in the request payload.",
-    )
-    parser.add_argument(
-        "--prompt",
-        default="Paris is great because",
-        help="Prompt to use for all benchmark requests.",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=128,
-        help="Max tokens to request for each completion.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.7,
-        help="Sampling temperature.",
-    )
-    parser.add_argument(
-        "--requests",
-        type=int,
-        default=16,
-        help="Number of measured requests per server (excluding warmup).",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=4,
-        help="Number of warmup requests per server.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=120,
-        help="Per-request timeout in seconds.",
-    )
-    parser.add_argument(
-        "--nvfp4-only",
-        action="store_true",
-        help="Only benchmark the NVFP4 server (no baseline comparison).",
-    )
-
-    args = parser.parse_args()
-
-    banner("DGX SPARK — NVFP4 LLM INFERENCE BENCHMARK")
-
-    # Always run NVFP4; baseline is optional if --nvfp4-only is set.
-    nv_summary = run_benchmark_for_server(
-        name="nvfp4",
-        url=args.nvfp4_url,
-        model=args.model,
-        prompt=args.prompt,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        requests_n=args.requests,
-        warmup=args.warmup,
-        timeout=args.timeout,
-    )
-
-    print_single_summary(nv_summary)
-
-    if args.nvfp4_only:
+    if not torch.cuda.is_available():
+        print("No CUDA device detected.")
         print()
-        print("NVFP4-only mode enabled; skipping baseline comparison.")
         return
 
-    base_summary = run_benchmark_for_server(
-        name="baseline",
-        url=args.baseline_url,
-        model=args.model,
-        prompt=args.prompt,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        requests_n=args.requests,
-        warmup=args.warmup,
-        timeout=args.timeout,
-    )
+    device = torch.device("cuda")
+    print(f"CUDA device    : {torch.cuda.get_device_name(device)}")
+    cap = torch.cuda.get_device_capability(device)
+    print(f"Compute cap    : sm_{cap[0]}{cap[1]}")
 
-    print_single_summary(base_summary)
-    print_compare_table(base_summary, nv_summary)
+    props = torch.cuda.get_device_properties(device)
+    total_gb = props.total_memory / (1024**3)
+    print(f"Total VRAM     : {total_gb:.2f} GB")
+
+    try:
+        free, total = torch.cuda.mem_get_info()
+        print(f"mem_get_info   : free={free / (1024**3):.2f} GB, total={total / (1024**3):.2f} GB")
+    except Exception:
+        pass
+
+    print("\nNOTE:")
+    print("  - This script does NOT use real NVFP4 Tensor Core kernels yet.")
+    print("  - It simulates a 4-bit weight pipeline and uses BF16 GEMM for matmul.")
+    print("  - Once PyTorch / TensorRT-LLM exposes FP4 GEMM for Blackwell,")
+    print("    this harness can be updated to call the true FP4 path.\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Experimental NVFP4-style GEMM benchmark for NVIDIA DGX Spark (GB10)."
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=8192,
+        help="Single square GEMM size to benchmark (M=N=K=size). Ignored if --sizes is provided.",
+    )
+    parser.add_argument(
+        "--sizes",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Optional list of sizes to benchmark. Example: --sizes 4096 8192 12288",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=30,
+        help="Number of timed iterations per size.",
+    )
+    args = parser.parse_args()
+
+    print_env_info()
+
+    sizes = args.sizes if args.sizes else [args.size]
+    results = {}
+
+    for s in sizes:
+        print(f"\n================ SIZE {s} ================\n")
+        try:
+            bf16_tflops = run_bf16_gemm(size=s, iters=args.iters)
+            fp4_tflops = run_nvfp4_style_gemm(size=s, iters=args.iters)
+            results[s] = (bf16_tflops, fp4_tflops)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"OOM at size {s}; skipping.")
+                results[s] = (0.0, 0.0)
+            else:
+                print(f"RuntimeError at size {s}: {e}")
+                results[s] = (0.0, 0.0)
+
+    print("\n=== SUMMARY (NVFP4-STYLE vs BF16 GEMM) ===")
+    print("Size\tBF16 TFLOPs\tNVFP4-style TFLOPs")
+    for s in sizes:
+        bf16, fp4 = results.get(s, (0.0, 0.0))
+        print(f"{s}\t{bf16:.2f}\t\t{fp4:.2f}")
+
+    print("\nNOTE:")
+    print("  - NVFP4-style TFLOPs here are still from BF16 matmul,")
+    print("    just with 4-bit weight quantization and dequantization.")
+    print("  - This is a pipeline / harness benchmark, NOT true FP4 Tensor Core math.")
+    print("  - Once NVIDIA exposes NVFP4 GEMM kernels in user space,")
+    print("    this script can be upgraded to measure real FP4 Tensor Core throughput.\n")
 
 
 if __name__ == "__main__":
