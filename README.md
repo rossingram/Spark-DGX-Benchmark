@@ -50,7 +50,18 @@ root@<container>:/workspace#
 
 ---
 
-### 2. Authenticate with Hugging Face (recommended)
+### 2. Install dependencies inside the container
+
+We explicitly pin NumPy < 2.0 because PyTorch extensions in these containers are still built against NumPy 1.x.
+
+```bash
+pip install --upgrade pip \
+  diffusers transformers accelerate sentencepiece safetensors huggingface_hub opencv-python "numpy<2"
+```
+
+---
+
+### 3. Authenticate with Hugging Face (recommended)
 
 Some models (SDXL Turbo, LLMs, etc.) require HF login.
 
@@ -59,17 +70,6 @@ hf auth login
 ```
 
 Paste your token when prompted.
-
----
-
-### 3. Install dependencies inside the container
-
-We explicitly pin NumPy < 2.0 because PyTorch extensions in these containers are still built against NumPy 1.x.
-
-```bash
-pip install --upgrade pip \
-  diffusers transformers accelerate sentencepiece safetensors huggingface_hub opencv-python "numpy<2"
-```
 
 ---
 
