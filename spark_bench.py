@@ -1,19 +1,17 @@
 #!/usr/bin/env python
-import time
+
 import math
-import shutil
+import os
 import subprocess
 import sys
+import time
 
-# -------- Utility helpers -------- #
+results = {}
 
-def log_section(title: str):
-    print("\n" + "=" * 80)
-    print(title)
-    print("=" * 80 + "\n")
 
-def log_sub(title: str):
-    print(f"\n--- {title} ---")
+# ------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------
 
 def has_module(name: str) -> bool:
     try:
@@ -22,71 +20,104 @@ def has_module(name: str) -> bool:
     except ImportError:
         return False
 
+
+def log_section(title: str):
+    print()
+    print("=" * 80)
+    print(title)
+    print("=" * 80)
+    print()
+
+
+def log_sub(title: str):
+    print()
+    print(f"--- {title} ---")
+
+
 def human_time(seconds: float) -> str:
     if seconds < 1e-3:
-        return f"{seconds*1e6:.1f} µs"
+        return f"{seconds * 1e6:.1f} µs"
     if seconds < 1:
-        return f"{seconds*1e3:.1f} ms"
+        return f"{seconds * 1e3:.1f} ms"
     return f"{seconds:.2f} s"
 
 
-# -------- RESULTS STORAGE -------- #
-
-results = {
-    "gemm_4096_tflops": None,
-    "gemm_6144_tflops": None,
-    "gemm_8192_tflops": None,
-    "mem_bw_2gb":        None,
-    "mem_bw_4gb":        None,
-    "kernel_latency_us": None,
-    "sd15_steps_sec":    None,
-    "sdxl_steps_sec":    None,
-    "flux_seconds":      None,
-    "llm_tokens_sec":    None,
-    "vram_max_safe_gb":  None,
-}
-
-def record(key, value):
-    if key in results:
-        results[key] = value
+def record(key: str, value):
+    results[key] = value
 
 
-# -------- 0. Environment / GPU info -------- #
+def fmt(x, default="—"):
+    if x is None:
+        return default
+    if isinstance(x, (int,)):
+        return str(x)
+    if isinstance(x, float):
+        if abs(x) >= 100:
+            return f"{x:.0f}"
+        elif abs(x) >= 10:
+            return f"{x:.1f}"
+        else:
+            return f"{x:.2f}"
+    return str(x)
+
+
+# ------------------------------------------------------------------------
+# 0. ENVIRONMENT / GPU INFO
+# ------------------------------------------------------------------------
 
 def bench_env():
     log_section("0. ENVIRONMENT / GPU INFO")
 
+    if not has_module("torch"):
+        print("PyTorch not installed; cannot run GPU benchmarks.")
+        return
+
+    import torch
+
+    # Be a bit aggressive about matmul kernels
+    torch.backends.cuda.matmul.allow_tf32 = True
     try:
-        import torch
-        print(f"Torch version: {torch.__version__}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            print(f"CUDA device count: {torch.cuda.device_count()}")
-            print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
-            print(f"Device capability: {torch.cuda.get_device_capability(0)}")
-            props = torch.cuda.get_device_properties(0)
-            print(f"Total VRAM (props): {props.total_memory/1e9:.2f} GB")
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            print(f"Total VRAM (mem_get_info): {total_bytes/1e9:.2f} GB")
-            print(f"Free VRAM  (mem_get_info): {free_bytes/1e9:.2f} GB")
-        else:
-            print("⚠ Torch reports CUDA unavailable. Benchmarks will be CPU-only or skipped.")
-    except Exception as e:
-        print("Error inspecting torch / CUDA:", e)
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
 
-    # Show nvidia-smi summary if available
-    if shutil.which("nvidia-smi"):
-        print("\n[nvidia-smi]")
+    print("Importing torch...")
+    print("Torch version:", torch.__version__)
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA device count:", torch.cuda.device_count())
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        dev = torch.device("cuda")
+        print("CUDA device name:", torch.cuda.get_device_name(dev))
+        cap = torch.cuda.get_device_capability(dev)
+        print("Device capability:", cap)
+        props = torch.cuda.get_device_properties(dev)
+        total_vram_gb = props.total_memory / (1024**3)
+        print(f"Total VRAM (props): {total_vram_gb:.2f} GB")
+
         try:
-            out = subprocess.check_output(["nvidia-smi"], text=True)
-            print(out)
+            free, total = torch.cuda.mem_get_info()
+            print(f"Total VRAM (mem_get_info): {total / (1024**3):.2f} GB")
+            print(f"Free VRAM  (mem_get_info): {free / (1024**3):.2f} GB")
         except Exception as e:
-            print("Error running nvidia-smi:", e)
-    else:
-        print("\nNo nvidia-smi found on PATH.")
+            print("mem_get_info not available:", e)
+
+    print()
+    print("[nvidia-smi]")
+    try:
+        out = subprocess.run(
+            ["nvidia-smi"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        print(out.stdout)
+    except FileNotFoundError:
+        print("nvidia-smi not found in this environment.")
 
 
-# -------- 1. GEMM / Tensor Core TFLOPs -------- #
+# ------------------------------------------------------------------------
+# 1. GEMM / TENSOR CORE TFLOPs
+# ------------------------------------------------------------------------
 
 def bench_matmul(size=4096, iters=40, key=None):
     import torch
@@ -97,7 +128,13 @@ def bench_matmul(size=4096, iters=40, key=None):
 
     log_sub(f"GEMM throughput at {size}x{size}, {iters} iters")
     x = torch.randn(size, size, device="cuda", dtype=torch.float16)
+    x = x.contiguous()
+
+    # Warmup
+    for _ in range(10):
+        y = x @ x
     torch.cuda.synchronize()
+
     t0 = time.time()
     for _ in range(iters):
         y = x @ x
@@ -109,20 +146,21 @@ def bench_matmul(size=4096, iters=40, key=None):
         record(key, tflops)
 
 
-def run_gemm_suite():
-    import torch
-    if not torch.cuda.is_available():
-        log_section("1. GEMM / TENSOR CORE TFLOPs")
-        print("CUDA not available; skipping.")
+def bench_gemm():
+    log_section("1. GEMM / TENSOR CORE TFLOPs")
+
+    if not has_module("torch"):
+        print("PyTorch not installed; skipping GEMM.")
         return
 
-    log_section("1. GEMM / TENSOR CORE TFLOPs")
-    bench_matmul(4096, 40, key="gemm_4096_tflops")
-    bench_matmul(6144, 20, key="gemm_6144_tflops")
-    bench_matmul(8192, 10, key="gemm_8192_tflops")
+    bench_matmul(size=4096, iters=40, key="gemm_4096_tflops")
+    bench_matmul(size=6144, iters=20, key="gemm_6144_tflops")
+    bench_matmul(size=8192, iters=10, key="gemm_8192_tflops")
 
 
-# -------- 2. Memory Bandwidth -------- #
+# ------------------------------------------------------------------------
+# 2. MEMORY BANDWIDTH
+# ------------------------------------------------------------------------
 
 def memory_bw(size_gb=2, key=None):
     import torch
@@ -143,59 +181,66 @@ def memory_bw(size_gb=2, key=None):
         b.copy_(a, non_blocking=True)
     torch.cuda.synchronize()
 
+    iters = 10
     t0 = time.time()
-    for _ in range(10):
+    for _ in range(iters):
         b.copy_(a, non_blocking=True)
     torch.cuda.synchronize()
     dt = time.time() - t0
 
-    # 10 copies of size_gb each
-    total_gb = size_gb * 10
+    total_gb = size_gb * iters
     bw = total_gb / dt
-    print(f"Time: {human_time(dt)}  |  Approx BW: {bw:.1f} GB/s")
+    print(f"Time: {human_time(dt)}  |  Approx BW: {bw:.2f} GB/s")
     if key:
         record(key, bw)
 
 
-def run_mem_bw_suite():
-    import torch
-    if not torch.cuda.is_available():
-        log_section("2. MEMORY BANDWIDTH")
-        print("CUDA not available; skipping.")
-        return
-
+def bench_mem():
     log_section("2. MEMORY BANDWIDTH")
-    memory_bw(2, key="mem_bw_2gb")
-    memory_bw(4, key="mem_bw_4gb")
 
-
-# -------- 3. Kernel launch latency -------- #
-
-def tiny_kernel(iters=20000):
-    import torch
-    if not torch.cuda.is_available():
-        print("CUDA not available; skipping kernel latency test.")
+    if not has_module("torch"):
+        print("PyTorch not installed; skipping.")
         return
+
+    memory_bw(size_gb=2, key="mem_bw_2gb")
+    memory_bw(size_gb=4, key="mem_bw_4gb")
+
+
+# ------------------------------------------------------------------------
+# 3. CUDA KERNEL LAUNCH LATENCY
+# ------------------------------------------------------------------------
+
+def bench_kernel_latency():
+    log_section("3. CUDA KERNEL LAUNCH LATENCY")
+
+    if not has_module("torch"):
+        print("PyTorch not installed; skipping kernel latency.")
+        return
+
+    import torch
+
+    if not torch.cuda.is_available():
+        print("CUDA not available; skipping kernel latency.")
+        return
+
+    x = torch.randn(1, device="cuda")
+    iters = 20000
 
     log_sub("Kernel launch latency (tiny add kernel)")
-    x = torch.randn((1,), device="cuda")
     torch.cuda.synchronize()
     t0 = time.time()
     for _ in range(iters):
         y = x + 1
     torch.cuda.synchronize()
     dt = time.time() - t0
-    latency_us = dt/iters*1e6
-    print(f"Average launch latency: {latency_us:.2f} µs over {iters} iters")
-    record("kernel_latency_us", latency_us)
+    avg_us = dt / iters * 1e6
+    print(f"Average launch latency: {avg_us:.2f} µs over {iters} iters")
+    record("kernel_latency_us", avg_us)
 
 
-def run_kernel_latency():
-    log_section("3. CUDA KERNEL LAUNCH LATENCY")
-    tiny_kernel()
-
-
-# -------- 4. Stable Diffusion 1.5 -------- #
+# ------------------------------------------------------------------------
+# 4. STABLE DIFFUSION 1.5
+# ------------------------------------------------------------------------
 
 def run_sd15_bench():
     if not has_module("diffusers"):
@@ -219,7 +264,7 @@ def run_sd15_bench():
     print(f"Loading pipeline: {model_id}")
     pipe = DiffusionPipeline.from_pretrained(
         model_id,
-        torch_dtype=torch.float16
+        torch_dtype=torch.float16,
     ).to("cuda")
 
     print("Running SD 1.5 benchmark...")
@@ -233,7 +278,9 @@ def run_sd15_bench():
     record("sd15_steps_sec", sps)
 
 
-# -------- 5. SDXL -------- #
+# ------------------------------------------------------------------------
+# 5. SDXL
+# ------------------------------------------------------------------------
 
 def run_sdxl_bench():
     if not has_module("diffusers"):
@@ -251,13 +298,13 @@ def run_sdxl_bench():
 
     log_section("5. SDXL")
     model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-    prompt = "cinematic sci-fi scene, highly detailed"
+    prompt = "a highly detailed photograph of a tiny robot on a wooden desk"
     steps = 30
 
     print(f"Loading pipeline: {model_id}")
     pipe = DiffusionPipeline.from_pretrained(
         model_id,
-        torch_dtype=torch.float16
+        torch_dtype=torch.float16,
     ).to("cuda")
 
     print("Running SDXL benchmark...")
@@ -271,54 +318,53 @@ def run_sdxl_bench():
     record("sdxl_steps_sec", sps)
 
 
-# -------- 6. Flux (if available) -------- #
+# ------------------------------------------------------------------------
+# 6. SDXL TURBO (fast image benchmark, optional)
+# ------------------------------------------------------------------------
 
-def run_flux_bench():
+def run_sdxl_turbo_bench():
     if not has_module("diffusers"):
-        log_section("6. FLUX (MMDiT)")
-        print("diffusers not installed; skipping Flux.")
+        log_section("6. SDXL TURBO")
+        print("diffusers not installed; skipping SDXL Turbo.")
         return
 
     import torch
     from diffusers import DiffusionPipeline
-    from huggingface_hub.errors import GatedRepoError
 
     if not torch.cuda.is_available():
-        log_section("6. FLUX (MMDiT)")
-        print("CUDA not available; skipping Flux.")
+        log_section("6. SDXL TURBO")
+        print("CUDA not available; skipping SDXL Turbo.")
         return
 
-    log_section("6. FLUX (MMDiT)")
-    model_id = "black-forest-labs/FLUX.1-schnell"
+    log_section("6. SDXL TURBO")
+    model_id = "stabilityai/sdxl-turbo"
     prompt = "hello world on the NVIDIA DGX Spark"
 
     print(f"Loading pipeline: {model_id}")
     try:
         pipe = DiffusionPipeline.from_pretrained(
             model_id,
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16,
         ).to("cuda")
-    except GatedRepoError as e:
-        print("Flux model is gated on Hugging Face and requires authentication.")
-        print("Skipping Flux benchmark. Details:")
-        print(e)
-        return
     except Exception as e:
-        print("Unexpected error loading Flux model; skipping Flux benchmark.")
+        print("Failed to load SDXL Turbo; skipping.")
         print(e)
         return
 
-    print("Running Flux benchmark...")
+    print("Running SDXL Turbo benchmark...")
     torch.cuda.synchronize()
     t0 = time.time()
-    _ = pipe(prompt).images[0]
+    _ = pipe(prompt, num_inference_steps=4).images[0]
     torch.cuda.synchronize()
     dt = time.time() - t0
-    print(f"Flux inference time: {dt:.2f} s")
-    record("flux_seconds", dt)
+
+    print(f"SDXL Turbo time: {dt:.2f} s")
+    record("sdxl_turbo_seconds", dt)
 
 
-# -------- 7. LLM throughput (PyTorch) -------- #
+# ------------------------------------------------------------------------
+# 7. LLM THROUGHPUT (PyTorch, open model)
+# ------------------------------------------------------------------------
 
 def run_llm_bench():
     if not has_module("transformers"):
@@ -328,7 +374,6 @@ def run_llm_bench():
 
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
     if not torch.cuda.is_available():
         log_section("7. LLM THROUGHPUT (PyTorch)")
@@ -337,9 +382,9 @@ def run_llm_bench():
 
     log_section("7. LLM THROUGHPUT (PyTorch)")
 
-    # Default: Llama 3 8B Instruct (gated, requires HF token + access)
-    # You can change this to an open model if you want (see below).
-    model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+    # Use an open model so no HF token is required.
+    # You can change this to Llama 3 etc. if you want, but then you'll need HF auth.
+    model_id = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
     prompt = "Hello, this is a speed benchmark on the NVIDIA DGX Spark."
 
     print(f"Loading model: {model_id}")
@@ -348,26 +393,10 @@ def run_llm_bench():
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.float16,
-            device_map="cuda"
+            device_map="cuda",
         )
-    except GatedRepoError as e:
-        print("LLM model is gated on Hugging Face and requires authentication.")
-        print("Skipping LLM benchmark. Details:")
-        print(e)
-        return
-    except RepositoryNotFoundError as e:
-        print("LLM repo not found on Hugging Face. Check the model_id or your access.")
-        print("Skipping LLM benchmark. Details:")
-        print(e)
-        return
-    except OSError as e:
-        print("OS / HuggingFace Hub error while loading LLM model.")
-        print("This usually means missing access or a bad model_id.")
-        print("Skipping LLM benchmark. Details:")
-        print(e)
-        return
     except Exception as e:
-        print("Unexpected error loading LLM model. Skipping LLM benchmark.")
+        print("Failed to load LLM model; skipping LLM benchmark.")
         print(e)
         return
 
@@ -381,171 +410,155 @@ def run_llm_bench():
     t0 = time.time()
     _ = model.generate(**inputs, max_new_tokens=new_tokens)
     torch.cuda.synchronize()
-    t1 = time.time()
+    dt = time.time() - t0
 
-    dt = t1 - t0
     tps = new_tokens / dt
     print(f"Generated {new_tokens} tokens in {dt:.2f} s  |  {tps:.1f} tokens/sec")
     record("llm_tokens_sec", tps)
 
-# -------- 8. TensorRT-LLM (if installed) -------- #
 
-def run_trt_llm_bench():
-    if not has_module("tensorrt_llm"):
-        log_section("8. TENSORRT-LLM")
-        print("tensorrt_llm not installed; skipping TRT-LLM bench.")
+# ------------------------------------------------------------------------
+# 8. VRAM / UNIFIED MEMORY PROBE
+# ------------------------------------------------------------------------
+
+def run_vram_bench():
+    if not has_module("torch"):
+        log_section("8. VRAM / UNIFIED MEMORY PROBE")
+        print("PyTorch not installed; skipping.")
         return
 
-    log_section("8. TENSORRT-LLM")
-    print("NOTE: This is a placeholder hook; actual TRT-LLM configs are model & env-specific.")
-    try:
-        import tensorrt_llm
-        print(f"TensorRT-LLM version: {tensorrt_llm.__version__}")
-        print("For full benchmarking, integrate your TRT-LLM engine here.")
-    except Exception as e:
-        print("Error inspecting tensorrt_llm:", e)
-
-
-# -------- 9. VRAM pressure test (safe) -------- #
-
-def run_vram_pressure(max_fraction=0.7, step_gb=2):
     import torch
+
     if not torch.cuda.is_available():
-        log_section("9. VRAM PRESSURE TEST")
-        print("CUDA not available; skipping VRAM test.")
+        log_section("8. VRAM / UNIFIED MEMORY PROBE")
+        print("CUDA not available; skipping.")
         return
 
-    log_section("9. VRAM PRESSURE TEST")
+    log_section("8. VRAM / UNIFIED MEMORY PROBE")
 
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
-    total_gb = total_bytes / 1e9
-    print(f"Reported total VRAM (mem_get_info): {total_gb:.2f} GB")
+    free, total = torch.cuda.mem_get_info()
+    total_gb = total / (1024**3)
+    print(f"Reported total CUDA-visible memory: {total_gb:.2f} GB")
 
-    target_gb = total_gb * max_fraction
-    print(f"Targeting up to ~{target_gb:.2f} GB ({max_fraction*100:.0f}% of total)")
+    # We'll binary-search the max single allocation in GB,
+    # but cap at something reasonable (e.g., 96 GB) for Spark.
+    low = 1.0
+    high = min(96.0, total_gb * 0.9)
+    best = 0.0
 
-    last_success_gb = 0.0
-    gb = step_gb
-    while gb <= target_gb:
+    print("Probing max safe single allocation size...")
+    while high - low > 0.5:
+        mid = (low + high) / 2.0
+        num_elems = int(mid * 1e9 / 2)  # FP16
+
         try:
-            print(f"\nAllocating ~{gb} GB (FP16 tensor)...")
-            num_elems = int(gb * 1e9 / 2)  # FP16 = 2 bytes
             x = torch.empty(num_elems, device="cuda", dtype=torch.float16)
             torch.cuda.synchronize()
-
-            free_after, total_after = torch.cuda.mem_get_info()
-            used_gb = (total_after - free_after) / 1e9
-            free_gb = free_after / 1e9
-            print(f"Approx used VRAM after alloc: {used_gb:.2f} GB")
-            print(f"Approx free VRAM after alloc: {free_gb:.2f} GB")
-
-            last_success_gb = gb
-
-            # Free allocation and clear cache
             del x
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-
-            gb += step_gb
-
+            best = mid
+            low = mid
+            print(f"  OK at ~{mid:.1f} GB")
         except RuntimeError as e:
-            print(f"PyTorch raised at ~{gb} GB: {e}")
+            if "out of memory" in str(e).lower():
+                print(f"  OOM at ~{mid:.1f} GB")
+                high = mid
+                torch.cuda.empty_cache()
+            else:
+                print("  RuntimeError during allocation; stopping probe.")
+                print(e)
+                break
+        except Exception as e:
+            print("  Unexpected error during allocation; stopping probe.")
+            print(e)
             break
 
-    if last_success_gb > 0:
-        print(f"\nMax safe VRAM allocation in this probe: ~{last_success_gb:.2f} GB")
-        record("vram_max_safe_gb", last_success_gb)
-    else:
-        print("\nNo successful allocations; something is off.")
-        record("vram_max_safe_gb", None)
+    print(f"Max tested safe single allocation: {best:.1f} GB")
+    record("vram_max_gb", best)
 
 
-# -------- FINAL SUMMARY -------- #
-
-def fmt(v):
-    return "—" if v is None else f"{v:,.2f}"
+# ------------------------------------------------------------------------
+# FINAL SUMMARY
+# ------------------------------------------------------------------------
 
 def print_final_summary():
     log_section("FINAL SUMMARY — SPARK vs 4090 vs H100")
 
-    print("All numbers approximate. Spark = Your machine.\n")
+    # Pull values with defaults
+    gemm_4096 = results.get("gemm_4096_tflops")
+    gemm_6144 = results.get("gemm_6144_tflops")
+    gemm_8192 = results.get("gemm_8192_tflops")
+    bw_2g = results.get("mem_bw_2gb")
+    bw_4g = results.get("mem_bw_4gb")
+    lat_us = results.get("kernel_latency_us")
+    sd15 = results.get("sd15_steps_sec")
+    sdxl = results.get("sdxl_steps_sec")
+    sdxl_turbo = results.get("sdxl_turbo_seconds")
+    llm_tps = results.get("llm_tokens_sec")
+    vram_max = results.get("vram_max_gb")
 
-    print("RAW COMPUTE (TFLOPs, FP16/BF16)")
-    print(f"""\
+    print("""
+RAW COMPUTE (TFLOPs, FP16/BF16)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
-    ------------------------------------------------------------------------
-    GEMM 4096 size        {fmt(results['gemm_4096_tflops']).rjust(8)}     330.00        1000.00
-    GEMM 6144 size        {fmt(results['gemm_6144_tflops']).rjust(8)}     330.00        1000.00
-    GEMM 8192 size        {fmt(results['gemm_8192_tflops']).rjust(8)}     330.00        1000.00
-    """)
+    ------------------------------------------------------------------------""")
+    print(f"    GEMM 4096 size       {fmt(gemm_4096).rjust(8)}     330.00        1000.00")
+    print(f"    GEMM 6144 size       {fmt(gemm_6144).rjust(8)}     330.00        1000.00")
+    print(f"    GEMM 8192 size       {fmt(gemm_8192).rjust(8)}     330.00        1000.00")
 
-    print("\nMEMORY BANDWIDTH (GB/s)")
-    print(f"""\
+    print("""
+MEMORY BANDWIDTH (GB/s)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
-    ------------------------------------------------------------------------
-    2GB clone             {fmt(results['mem_bw_2gb']).rjust(8)}      700.00       2000.00
-    4GB clone             {fmt(results['mem_bw_4gb']).rjust(8)}      700.00       2000.00
-    """)
+    ------------------------------------------------------------------------""")
+    print(f"    2GB clone             {fmt(bw_2g).rjust(8)}     700.00       2000.00")
+    print(f"    4GB clone             {fmt(bw_4g).rjust(8)}     700.00       2000.00")
 
-    print("\nKERNEL LATENCY (Microseconds)")
-    print(f"""\
+    print("""
+KERNEL LATENCY (Microseconds)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
-    ------------------------------------------------------------------------
-    Tiny kernel           {fmt(results['kernel_latency_us']).rjust(8)}       15.00          5.00
-    """)
+    ------------------------------------------------------------------------""")
+    print(f"    Tiny kernel           {fmt(lat_us).rjust(8)}       15.00          5.00")
 
-    print("\nIMAGE MODELS")
-    print(f"""\
-    ------------------------------------------------------------------------
-    Test                       Spark        RTX 4090       H100
-    ------------------------------------------------------------------------
-    SD1.5 steps/sec       {fmt(results['sd15_steps_sec']).rjust(8)}       8–12         15–20
-    SDXL steps/sec        {fmt(results['sdxl_steps_sec']).rjust(8)}       2–3           6–8
-    FLUX seconds          {fmt(results['flux_seconds']).rjust(8)}        ~1.8           ~0.9
-    """)
-
-    print("\nLLM THROUGHPUT (tokens/sec)")
-    print(f"""\
+    print("""
+IMAGE MODELS
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
-    ------------------------------------------------------------------------
-    Llama-3 8B            {fmt(results['llm_tokens_sec']).rjust(8)}     150–300       800–1200
-    """)
+    ------------------------------------------------------------------------""")
+    print(f"    SD1.5 steps/sec       {fmt(sd15).rjust(8)}       8–12         15–20")
+    print(f"    SDXL steps/sec        {fmt(sdxl).rjust(8)}       2–3           6–8")
+    print(f"    SDXL Turbo seconds    {fmt(sdxl_turbo).rjust(8)}     ~0.3s         ~0.15s")
 
-    print("\nVRAM USABLE RANGE (GB)")
-    print(f"""\
+    print("""
+LLM THROUGHPUT (tokens/sec)
     ------------------------------------------------------------------------
     Test                       Spark        RTX 4090       H100
+    ------------------------------------------------------------------------""")
+    print(f"    SmolLM2 1.7B          {fmt(llm_tps).rjust(8)}     150–300       800–1200")
+
+    print("""
+VRAM USABLE RANGE (GB)
     ------------------------------------------------------------------------
-    Max safe VRAM         {fmt(results['vram_max_safe_gb']).rjust(8)}        18–20         70–80
-    """)
-
-    print("\nCLASSIFICATION:")
-    if results["gemm_4096_tflops"] and results["gemm_4096_tflops"] > 500:
-        tier = "✔ DATACENTER-LITE TIER — almost H100-class compute"
-    else:
-        tier = "✔ PREMIUM WORKSTATION TIER — well above consumer GPUs"
-
-    print(tier)
-    print("\nDONE.\n")
+    Test                       Spark        RTX 4090       H100
+    ------------------------------------------------------------------------""")
+    print(f"    Max safe VRAM         {fmt(vram_max).rjust(8)}        18–20         70–80")
 
 
-# -------- MAIN -------- #
+# ------------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------------
 
 def main():
     bench_env()
-    run_gemm_suite()
-    run_mem_bw_suite()
-    run_kernel_latency()
+    bench_gemm()
+    bench_mem()
+    bench_kernel_latency()
     run_sd15_bench()
     run_sdxl_bench()
-    run_flux_bench()
+    run_sdxl_turbo_bench()
     run_llm_bench()
-    run_trt_llm_bench()
-    run_vram_pressure(max_fraction=0.7)
+    run_vram_bench()
     print_final_summary()
 
 
