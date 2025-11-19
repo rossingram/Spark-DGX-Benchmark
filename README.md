@@ -56,7 +56,21 @@ We explicitly pin NumPy < 2.0 because PyTorch extensions in these containers are
 
 ```bash
 pip install --upgrade pip \
-  diffusers transformers accelerate sentencepiece safetensors huggingface_hub opencv-python "numpy<2"
+  diffusers transformers accelerate sentencepiece safetensors huggingface_hub tqdm opencv-python "numpy<2"
+```
+### (Optional) For gpt-oss-120b via vLLM (gpt_oss_benchmark.py), add:
+#### a) vLLM build that supports gpt-oss (from the OpenAI cookbook)
+
+```bash
+pip install --pre vllm==0.10.1+gptoss \
+  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
+  --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \
+  --index-strategy unsafe-best-match
+```
+
+#### b) OpenAI Python client (to hit the local vLLM server)
+```bash
+pip install "openai>=1.55.0"
 ```
 
 ---
@@ -99,6 +113,15 @@ You should now see a full benchmark report including:
 * LLM tokens/sec
 * Unified memory slewing limits
 * Comparison table vs 4090, L40S, H200, GH200, and H100
+
+#### (Optional) For gpt_oss_benchmark.py, you’ll run the vLLM server inside the same container (or another shell attached to it) that gives you a local OpenAI-compatible server at http://localhost:8000/v1 serving openai/gpt-oss-120b:
+
+```bash
+# minimal to start; you can tune later
+vllm serve openai/gpt-oss-120b \
+  --tensor-parallel-size 1 \
+  --trust-remote-code
+```
 
 ---
 
