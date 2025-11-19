@@ -39,7 +39,7 @@ This container contains:
 * A clean, known-good environment for reproducible benchmarks
 
 ```bash
-docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -it nvcr.io/nvidia/pytorch:25.09-py3
+docker run --gpus all -it nvcr.io/nvidia/pytorch:25.09-py3
 ```
 
 You should now be inside:
@@ -55,7 +55,8 @@ root@<container>:/workspace#
 We explicitly pin NumPy < 2.0 because PyTorch extensions in these containers are still built against NumPy 1.x.
 
 ```bash
-pip install --upgrade pip diffusers transformers accelerate sentencepiece safetensors huggingface_hub tqdm opencv-python "numpy<2"
+pip install --upgrade pip \
+  diffusers transformers accelerate sentencepiece safetensors huggingface_hub tqdm opencv-python "numpy<2"
 ```
 ### (Optional) For gpt-oss-120b via vLLM (gpt_oss_benchmark.py), add:
 #### a) vLLM build that supports gpt-oss (from the OpenAI cookbook)
