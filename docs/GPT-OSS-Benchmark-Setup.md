@@ -77,9 +77,10 @@ vllm serve "openai/gpt-oss-120b" \
   --trust-remote-code \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.7 \
-  --swap-space 16 \
-  --max-model-len 32000 \
-  --max-num-seqs 1024
+  --swap-space 32 \
+  --max-model-len 64000 \
+  --max-num-seqs 512 \
+  --gpu-memory-utilization 0.75
 ```
 
 This exposes:
